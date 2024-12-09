@@ -196,23 +196,19 @@ def getUserInfo(
     garmin_password,
     isOnline,
     local_list,
+    is_cn,
+    upload_after=None,
 ):
-
     fetcher = WeightDataFetcher(account, password, nickname)
     fetcher.login()
     fetcher.get_access_token()
+    print("开始获取体重数据...")
     weight_data = fetcher.get_weight_data()
     online_list = [item["timeStamp"] for item in weight_data]
     get_weekly_data(fetcher.access_token, fetcher.user_id_real, nickname, account)
-    if local_list:
-        filtered_data = [
-            item for item in weight_data if item["timeStamp"] not in local_list
-        ]
+    
     if garmin_account and garmin_password:
-        if filtered_data:
-            upload_to_garmin(garmin_account, garmin_password, filtered_data)
-        else:
-            print("garmin已是最新体重记录")
+        upload_to_garmin(garmin_account, garmin_password, weight_data, is_cn, upload_after)
     get_user_report(weight_data, account, nickname, height, isOnline)
 
 
@@ -331,7 +327,7 @@ def get_physique_type(bmi, body_fat):
         return "未知类型"
 
 
-def upload_to_garmin(email, password, data):
+def upload_to_garmin(email, password, data, is_cn, upload_after=None):
     from garminconnect import (
         Garmin,
         GarminConnectConnectionError,
@@ -340,7 +336,30 @@ def upload_to_garmin(email, password, data):
     )
     from datetime import datetime, timezone, timedelta
 
+    # 如果指定了 upload_after，将其转换为时间戳
+    upload_after_timestamp = None
+    if upload_after:
+        upload_after_date = datetime.strptime(upload_after, "%Y-%m-%d")
+        upload_after_timestamp = upload_after_date.timestamp()
+
+    try:
+        # 只创建一次客户端实例并登录
+        garmin_client = Garmin(email, password, is_cn=is_cn)
+        garmin_client.login()
+        print(f"佳明（{'国内' if is_cn else '国际'}）登录成功！")
+    except (
+        GarminConnectConnectionError,
+        GarminConnectAuthenticationError,
+        GarminConnectTooManyRequestsError,
+    ) as err:
+        print(f"佳明（{'国内' if is_cn else '国际'}）登录失败: %s" % err)
+        quit()
+
     for item in data:
+        # 如果设置了 upload_after，跳过早于该日期的数据
+        if upload_after_timestamp and item.get("timeStamp") < upload_after_timestamp:
+            continue
+            
         createTime = item.get("createTime")
         timestamp = item.get("timeStamp")
         weight = item.get("weight")
@@ -360,33 +379,25 @@ def upload_to_garmin(email, password, data):
         china_tz = timezone(timedelta(hours=8))
         dt_china = dt.astimezone(china_tz)
         iso_timestamp = dt_china.isoformat()
+
         try:
-            garmin_client = Garmin(email, password, is_cn=True)
-            garmin_client.login()
-            print("佳明（cn）登陆成功！")  # 添加登录成功的提示
-        except (
-            GarminConnectConnectionError,
-            GarminConnectAuthenticationError,
-            GarminConnectTooManyRequestsError,
-        ) as err:
-            print("佳明（cn）登陆失败: %s" % err)
-            quit()
-        garmin_client.add_body_composition(
-            timestamp=iso_timestamp,
-            weight=weight,
-            percent_fat=percent_fat,
-            percent_hydration=percent_hydration,
-            visceral_fat_mass=visceral_fat_mass,
-            bone_mass=bone_mass,
-            muscle_mass=muscle_mass,
-            basal_met=basal_met,
-            # active_met=active_met,
-            physique_rating=physique_rating,
-            metabolic_age=metabolic_age,
-            visceral_fat_rating=visceral_fat_rating,
-            bmi=bmi,
-        )
-        print(f"{createTime} 的体重：{weight}kg，已经上传成功！")
+            garmin_client.add_body_composition(
+                timestamp=iso_timestamp,
+                weight=weight,
+                percent_fat=percent_fat,
+                percent_hydration=percent_hydration,
+                visceral_fat_mass=visceral_fat_mass,
+                bone_mass=bone_mass,
+                muscle_mass=muscle_mass,
+                basal_met=basal_met,
+                physique_rating=physique_rating,
+                metabolic_age=metabolic_age,
+                visceral_fat_rating=visceral_fat_rating,
+                bmi=bmi,
+            )
+            print(f"{createTime} 的体重：{weight}kg，已经上传成功！")
+        except Exception as e:
+            print(f"上传失败 {createTime}: {str(e)}")
 
 
 def parse_sync_time(sync_time_str):
@@ -467,7 +478,7 @@ def generate_report(data):
     rank = 0  # 初始排名
     for item in data:
         if item["weight"] > weight_to_rank:
-            rank += 1  # 如果发现 weight 大于最新的 weight，排名加 1
+            rank += 1  # 如果发现 weight 大于最新的 weight��名加 1
     rank_percent = f"{round((len(data) - rank)/len(data)*100,2)}"
     latest_desc = f'{latest_date['weight']} kg | {latest_date['syncTime']} | <img src="https://img.shields.io/badge/TOP-{rank_percent}%25-blue" height="20">'
     max_weight_desc = f"{max_weight_data['weight']} kg | {max_weight_data['syncTime']}"
@@ -537,7 +548,7 @@ def get_weekly_report(data, nickname, account):
     # BMI 和其他指标
     current_bmi = data["weight"]["bmi"]
 
-    # 本周脂肪、肌肉等其他指标
+    # 本周脂、肌肉等其他指标
     weight_change = "-"
     weight_data = "-"
 
@@ -679,9 +690,23 @@ if __name__ == "__main__":
     parser.add_argument(
         "--isOnline", help="check if created by online", type=int, default=0
     )
+    parser.add_argument(
+        "--is_global", help="使用国际区服务器（默认使用中国区）", action='store_true', default=False
+    )
+    parser.add_argument(
+        "--upload_after", help="上传指定日期之后的数据，格式为YYYY-MM-DD", type=str, default=None
+    )
     options = parser.parse_args()
     input_string = options.input_string
     isOnline = options.isOnline
+    is_cn = not options.is_global  # 如果使用国际区，则 is_cn 为 False
+    upload_after = options.upload_after
+
+    print("\n运行参数:")
+    print(f"isOnline: {isOnline}")
+    print(f"使用{'国内' if is_cn else '国际'}区服务器")
+    print(f"upload_after: {upload_after}")
+    print("————————————————————")
 
     users = parse_string(input_string)
     # print(users)
@@ -703,6 +728,8 @@ if __name__ == "__main__":
             user["garmin_password"],
             isOnline,
             local_list,
+            is_cn,
+            upload_after,
         )
         if isOnline == 1:
             zipUserFile(user["account"], "./static/result")
